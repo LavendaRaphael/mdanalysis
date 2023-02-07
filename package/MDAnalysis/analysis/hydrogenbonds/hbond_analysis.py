@@ -52,7 +52,7 @@ Options:
   - *acceptors_sel* [None] : Atom selection for acceptors. If `None`, then will be identified via charge.
   - *d_h_cutoff* (Å) [1.2] : Distance cutoff used for finding donor-hydrogen pairs
   - *d_a_cutoff* (Å) [3.0] : Distance cutoff for hydrogen bonds. This cutoff refers to the D-A distance.
-  - *d_h_a_angle_cutoff* (degrees) [150] : D-H-A angle cutoff for hydrogen bonds.
+  - *h_d_a_angle_cutoff* (degrees) [150] : D-H-A angle cutoff for hydrogen bonds.
   - *update_selections* [True] : If true, will update atom selections at each frame.
 
 
@@ -266,7 +266,7 @@ class HydrogenBondAnalysis(AnalysisBase):
     def __init__(self, universe,
                  donors_sel=None, hydrogens_sel=None, acceptors_sel=None,
                  between=None, d_h_cutoff=1.2,
-                 d_a_cutoff=3.0, d_h_a_angle_cutoff=150,
+                 d_a_cutoff=3.0, h_d_a_angle_cutoff=30,
                  update_selections=True):
         """Set up atom selections and geometric criteria for finding hydrogen
         bonds in a Universe.
@@ -312,7 +312,7 @@ class HydrogenBondAnalysis(AnalysisBase):
             universe topology does not contain bonding information
         d_a_cutoff : float (optional)
             Distance cutoff for hydrogen bonds. This cutoff refers to the D-A distance.
-        d_h_a_angle_cutoff : float (optional)
+        h_d_a_angle_cutoff : float (optional)
             D-H-A angle cutoff for hydrogen bonds, in degrees.
         update_selections : bool (optional)
             Whether or not to update the acceptor, donor and hydrogen
@@ -374,7 +374,7 @@ class HydrogenBondAnalysis(AnalysisBase):
 
         self.d_h_cutoff = d_h_cutoff
         self.d_a_cutoff = d_a_cutoff
-        self.d_h_a_angle = d_h_a_angle_cutoff
+        self.h_d_a_angle = h_d_a_angle_cutoff
         self.update_selections = update_selections
         self.results = Results()
         self.results.hbonds = None
@@ -686,7 +686,7 @@ class HydrogenBondAnalysis(AnalysisBase):
 
 
     def _prepare(self):
-        self.results.hbonds = [[], [], [], [], [], []]
+        self.results.hbonds = [[], [], [], [], [], [], []]
 
         # Set atom selections if they have not been provided
         if self.acceptors_sel is None:
@@ -736,21 +736,21 @@ class HydrogenBondAnalysis(AnalysisBase):
             tmp_donors, tmp_hydrogens, tmp_acceptors = \
                 self._filter_atoms(tmp_donors, tmp_hydrogens, tmp_acceptors)
 
-        # Find D-H-A angles greater than d_h_a_angle_cutoff
-        d_h_a_angles = np.rad2deg(
+        # Find D-H-A angles greater than h_d_a_angle_cutoff
+        h_d_a_angles = np.rad2deg(
             calc_angles(
-                tmp_donors.positions,
                 tmp_hydrogens.positions,
+                tmp_donors.positions,
                 tmp_acceptors.positions,
                 box=box
             )
         )
-        hbond_indices = np.where(d_h_a_angles > self.d_h_a_angle)[0]
+        hbond_indices = np.where(h_d_a_angles < self.h_d_a_angle)[0]
 
         if np.size(hbond_indices) == 0:
             warnings.warn(
                 "No hydrogen bonds were found given angle of "
-                f"{self.d_h_a_angle} between Donor, {self.donors_sel}, and "
+                f"{self.h_d_a_angle} between Donor, {self.donors_sel}, and "
                 f"Acceptor, {self.acceptors_sel}."
             )
 
@@ -759,7 +759,7 @@ class HydrogenBondAnalysis(AnalysisBase):
         hbond_hydrogens = tmp_hydrogens[hbond_indices]
         hbond_acceptors = tmp_acceptors[hbond_indices]
         hbond_distances = d_a_distances[hbond_indices]
-        hbond_angles = d_h_a_angles[hbond_indices]
+        hbond_angles = h_d_a_angles[hbond_indices]
 
         # Store data on hydrogen bonds found at this frame
         self.results.hbonds[0].extend(np.full_like(hbond_donors,
@@ -769,6 +769,68 @@ class HydrogenBondAnalysis(AnalysisBase):
         self.results.hbonds[3].extend(hbond_acceptors.indices)
         self.results.hbonds[4].extend(hbond_distances)
         self.results.hbonds[5].extend(hbond_angles)
+
+        if np.size(hbond_indices) != 0:
+            list_nchain = self.nchain(hbond_acceptors)
+            self.results.hbonds[6].extend(list_nchain)
+
+    def nchain(self, chain_donors):
+
+        donors = chain_donors.unique
+        hydrogens = sum(d.bonded_atoms for d in donors)
+        donors = sum(h.bonded_atoms for h in hydrogens)
+        
+        box=self._ts.dimensions
+        d_a_indices, d_a_distances = capped_distance(
+            donors.positions,
+            self._acceptors.positions,
+            max_cutoff=self.d_a_cutoff,
+            min_cutoff=1.0,
+            box=box,
+        )
+
+        tmp_donors = donors[d_a_indices.T[0]]
+        tmp_hydrogens = hydrogens[d_a_indices.T[0]]
+        tmp_acceptors = self._acceptors[d_a_indices.T[1]]
+
+        h_d_a_angles = np.rad2deg(
+            calc_angles(
+                tmp_hydrogens.positions,
+                tmp_donors.positions,
+                tmp_acceptors.positions,
+                box=box
+            )
+        )
+        hbond_indices = np.where(h_d_a_angles < self.h_d_a_angle)[0]
+
+        # Retrieve atoms, distances and angles of hydrogen bonds
+        hbond_donors = tmp_donors[hbond_indices]
+        hbond_hydrogens = tmp_hydrogens[hbond_indices]
+        hbond_acceptors = tmp_acceptors[hbond_indices]
+
+        list_nchain = []
+        for donor in chain_donors:
+            int_tmp = np.count_nonzero(hbond_donors.indices == donor.index)
+            list_nchain.append(int_tmp)
+
+        return list_nchain
+
+    def nchain_count_by_time(self, int_min, int_max=None):
+
+        if int_max is None:
+            list_tof = (self.results.hbonds[:, 6] == int_min)
+        else:
+            list_tof = (self.results.hbonds[:, 6] >= int_min) & (self.results.hbonds[:, 6] < int_max)
+        indices, tmp_counts = np.unique(self.results.hbonds[list_tof][:, 0], axis=0,
+                                        return_counts=True)
+
+        indices -= self.start
+        indices /= self.step
+
+        counts = np.zeros_like(self.frames)
+        counts[indices.astype(np.intp)] = tmp_counts
+
+        return counts
 
     def _conclude(self):
 
